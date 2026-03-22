@@ -169,7 +169,7 @@ class AmazonPhotos:
                 raise
             except Exception as e:
                 if i == max_retries:
-                    logger.debug(f'Max retries exceeded\n{e}')
+                    logger.warning(f'Max retries exceeded\n{e}')
                     return
                 t = min(random.random() * (b ** i), m)
                 logger.debug(f'Retrying in {f"{t:.2f}"} seconds\t\t{e}')
@@ -299,7 +299,7 @@ class AmazonPhotos:
         if initial.get('count', 0) <= MAX_LIMIT:
             return format_nodes(pd.json_normalize(initial.get('data', [])))
 
-        offsets = range(offset, min(initial['count'], limit), MAX_LIMIT)
+        offsets = range(offset, min(initial.get('count', 0), limit), MAX_LIMIT)
         fns = (partial(self.q, offset=o, filters=filters, limit=MAX_LIMIT) for o in offsets)
         res.extend(asyncio.run(self.process(fns, desc='Search nodes', **kwargs)))
         return format_nodes(pd.json_normalize(y for x in res if isinstance(x, dict) for y in x.get('data', [])))
@@ -383,12 +383,16 @@ class AmazonPhotos:
                             return r
 
                         if r.status_code == 400:
-                            if r.json().get('message').startswith('Invalid filter:'):
+                            msg = ''
+                            try:
+                                msg = r.json().get('message') or ''
+                            except Exception:
+                                pass
+                            if msg.startswith('Invalid filter:'):
                                 logger.error(f'{r.status_code} {r.text}\t\tSee readme for query language syntax.')
-                                return
+                                return r
                             else:
                                 logger.error(f'{r.status_code} {r.text}')
-                                # sys.exit(1)
 
                         if r.status_code == 401:  # BadAuthenticationData
                             raise PermissionError('Cookies expired. Log in to Amazon Photos and copy fresh cookies.')
@@ -398,7 +402,7 @@ class AmazonPhotos:
                     raise
                 except Exception as e:
                     if i == max_retries:
-                        logger.debug(f'Max retries exceeded\n{e}')
+                        logger.warning(f'Max retries exceeded\n{e}')
                         return
                     t = min(random.random() * (b ** i), m)
                     logger.debug(f'Retrying in {f"{t:.2f}"} seconds\t\t{e}')
@@ -493,18 +497,22 @@ class AmazonPhotos:
                 'offset': offset,
                 'filters': filters or 'kind:(FILE* OR FOLDER*) AND status:(TRASH*)',
             },
-        ).json()
+        )
+        if r is None:
+            return pd.DataFrame()
+        initial = r.json()
+        count = initial.get('count', 0)
         res = [initial]
         # small number of results, no need to paginate
-        if initial['count'] <= MAX_LIMIT:
+        if count <= MAX_LIMIT:
             return format_nodes(pd.json_normalize(initial.get('data', [])))
 
         # see AWS error: E.g. "Offset + limit cannot be greater than 9999"
         # offset must be 9799 + limit of 200
-        if initial['count'] > MAX_NODES:
+        if count > MAX_NODES:
             offsets = MAX_NODE_OFFSETS
         else:
-            offsets = range(offset, min(initial['count'], limit), MAX_LIMIT)
+            offsets = range(offset, min(initial.get('count', 0), limit), MAX_LIMIT)
         fns = (partial(self._get_nodes, offset=o, filters=filters, limit=MAX_LIMIT, sort=sort) for o in offsets)
         res.extend(asyncio.run(self.process(fns, desc='Getting trashed nodes', **kwargs)))
         return format_nodes(pd.json_normalize(y for x in res if isinstance(x, dict) for y in x.get('data', [])))
@@ -607,7 +615,9 @@ class AmazonPhotos:
                     'searchContext': 'all',
                     'groupByForTime': 'year',
                 })
-            data = r.json()['aggregations']
+            if r is None:
+                return {}
+            data = r.json().get('aggregations', {})
             if out:
                 _out = Path(out)
                 _out.mkdir(parents=True, exist_ok=True)
@@ -630,7 +640,9 @@ class AmazonPhotos:
                 'ContentType': 'JSON',
             }
         )
-        data = r.json()['aggregations']
+        if r is None:
+            return {}
+        data = r.json().get('aggregations', {})
         if out:
             _out = Path(f'{category}.json')
             _out.write_bytes(orjson.dumps(data, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS))
@@ -658,7 +670,7 @@ class AmazonPhotos:
                 })
                 return r.json()
 
-        fns = (partial(patch, ids=ids) for ids in node_ids)
+        fns = (partial(patch, node_id=nid) for nid in node_ids)
         return asyncio.run(self.process(fns, desc='adding media to favorites', **kwargs))
 
     def unfavorite(self, node_ids: list[str] | pd.Series, **kwargs) -> list[dict]:
@@ -683,7 +695,7 @@ class AmazonPhotos:
                 })
                 return r.json()
 
-        fns = (partial(patch, ids=ids) for ids in node_ids)
+        fns = (partial(patch, node_id=nid) for nid in node_ids)
         return asyncio.run(self.process(fns, desc='removing media from favorites', **kwargs))
 
     def create_album(self, album_name: str, node_ids: list[str] | pd.Series):
@@ -803,7 +815,7 @@ class AmazonPhotos:
                 )
                 return r.json()
 
-        fns = (partial(patch, ids=ids) for ids in node_ids)
+        fns = (partial(patch, node_id=nid) for nid in node_ids)
         return asyncio.run(self.process(fns, desc='hiding media', **kwargs))
 
     def unhide(self, node_ids: list[str] | pd.Series, **kwargs) -> list[dict]:
@@ -831,7 +843,7 @@ class AmazonPhotos:
                 )
                 return r.json()
 
-        fns = (partial(patch, ids=ids) for ids in node_ids)
+        fns = (partial(patch, node_id=nid) for nid in node_ids)
         return asyncio.run(self.process(fns, desc='unhiding media', **kwargs))
 
     def rename_cluster(self, cluster_id: str, name: str) -> dict:
@@ -954,16 +966,19 @@ class AmazonPhotos:
 
         @return: list of folders
         """
+        from collections import deque
         folders = []
-        queue = [{'id': self.root['id']}]
+        queue = deque([{'id': self.root['id']}])
         while queue:
-            node = queue.pop(0)
+            node = queue.popleft()
             try:
                 r = self.backoff(
                     self.client.get,
                     f'{self.drive_url}/nodes/{node["id"]}/children',
                     params={'filters': 'kind:FOLDER', **self.base_params},
                 )
+                if r is None:
+                    continue
                 data = r.json().get('data', [])
                 folders.extend(data)
                 queue.extend(data)
@@ -1009,7 +1024,10 @@ class AmazonPhotos:
             node = nodes[item['id']]
             parents = item.get('parents') or []
             if parents and (parent_id := parents[0]):
-                parent = nodes[parent_id]
+                parent = nodes.get(parent_id)
+                if parent is None:
+                    logger.debug(f'build_tree: unknown parent_id {parent_id} for {item.get("name")}')
+                    continue
                 parent['children'].append(node)
                 node['path'] = parent['path'] | {parent['name']: parent_id} | {node['name']: node['id']}
             else:
@@ -1213,24 +1231,26 @@ class AmazonPhotos:
         if r is None:
             return r
         initial = r.json()
+        count = initial.get('count', 0)
         # small number of results, no need to paginate
-        if initial['count'] <= MAX_LIMIT:
-            if not (df := pd.json_normalize(initial['data'])).empty:
-                return format_nodes(df)
-            logger.info(f'No results found for {filters = }')
-            return
+        if count <= MAX_LIMIT:
+            data = initial.get('data', [])
+            if not data:
+                logger.info(f'No results found for {filters = }')
+                return None
+            return format_nodes(pd.json_normalize(data))
 
         res = [initial]
         # see AWS error: E.g. "Offset + limit cannot be greater than 9999"
         # offset must be 9799 + limit of 200
-        if initial['count'] > MAX_NODES:
+        if count > MAX_NODES:
             offsets = MAX_NODE_OFFSETS
         else:
-            offsets = range(offset, min(initial['count'], limit), MAX_LIMIT)
+            offsets = range(offset, min(count, limit), MAX_LIMIT)
         fns = (partial(self._get_nodes, offset=o, filters=filters, sort=sort, limit=limit) for o in offsets)
         res.extend(asyncio.run(self.process(fns, desc='Node Query', **kwargs)))
         return format_nodes(
-            pd.json_normalize(y for x in res for y in x.get('data', []))
+            pd.json_normalize(y for x in res if isinstance(x, dict) for y in x.get('data', []))
             .drop_duplicates('id')
             .reset_index(drop=True)
         )
@@ -1241,7 +1261,7 @@ class AmazonPhotos:
         fns = (partial(self._get_nodes, offset=0, filters=f'name:{name}', sort='', limit=1) for name in names)
         res = asyncio.run(self.process(fns, desc='Node Query', **kwargs))
         return format_nodes(
-            pd.json_normalize(y for x in res for y in x.get('data', []))
+            pd.json_normalize(y for x in res if isinstance(x, dict) for y in x.get('data', []))
             .drop_duplicates('id')
             .reset_index(drop=True)
         )
@@ -1268,6 +1288,8 @@ class AmazonPhotos:
                 'filters': filters,
             },
         )
+        if r is None:
+            return {}
         return r.json()
 
     def __at(self):
