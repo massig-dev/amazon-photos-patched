@@ -327,7 +327,7 @@ class AmazonPhotos:
         """
         dups = []
         unique = []
-        files = [x for x in Path(path).rglob('*') if x.is_file()]
+        files = [x for x in Path(path).rglob('*') if x.is_file() and not any(part in self.SKIP_FOLDER_NAMES for part in x.parts)]
 
         with ProcessPoolExecutor(max_workers=max_workers) as e:
             fut = {e.submit(self._md5, file): file for file in files}
@@ -412,16 +412,19 @@ class AmazonPhotos:
         path = Path(path)
         folder_map, folders = self.create_folders(path)
 
+        def _not_in_skip(f: Path) -> bool:
+            return not any(part in self.SKIP_FOLDER_NAMES for part in f.parts)
+
         if skip_dedup:
-            files = (x for x in path.rglob('*') if x.is_file())
+            files = (x for x in path.rglob('*') if x.is_file() and _not_in_skip(x))
         elif md5s:
-            files = self.dedup_files(path, md5s, max_workers)
+            files = (f for f in self.dedup_files(path, md5s, max_workers) if _not_in_skip(f))
         else:
             if 'md5' in self.db.columns:
-                files = self.dedup_files(path, set(self.db.md5), max_workers)
+                files = (f for f in self.dedup_files(path, set(self.db.md5), max_workers) if _not_in_skip(f))
             else:
                 logger.warning('`md5` column missing from database, skipping deduplication checks.')
-                files = (x for x in path.rglob('*') if x.is_file())
+                files = (x for x in path.rglob('*') if x.is_file() and _not_in_skip(x))
 
         relmap = folder_relmap(path.name, files, folder_map)
         fns = (partial(post, pid=pid, file=file) for pid, file in relmap)
@@ -1057,6 +1060,12 @@ class AmazonPhotos:
             last_child = i == len(node['children']) - 1
             self.print_tree(child, show_id, color, indent, prefix, last_child)
 
+    # Synology / macOS / Windows のシステムフォルダを除外
+    SKIP_FOLDER_NAMES = frozenset({
+        '@eaDir', '#recycle', '.DS_Store', 'Thumbs.db',
+        '@tmp', '#snapshot', '.synology_recycle',
+    })
+
     def create_folders(self, path: str | Path) -> tuple[dict, list[dict]]:
         """
         Recursively create folders in Amazon Photos
@@ -1103,7 +1112,7 @@ class AmazonPhotos:
             rel = Path(*path_.parts[idx:])
             folder_map[str(rel)] = fid  # track parent folder id relative to root
             for p in path_.iterdir():
-                if p.is_dir():
+                if p.is_dir() and p.name not in self.SKIP_FOLDER_NAMES:
                     await Q.put([fid, p])  # map to newly created folder(s) ID
             return folder
 
@@ -1131,7 +1140,7 @@ class AmazonPhotos:
             # init queue with root folder + sub-folders
             Q = asyncio.Queue()
             for p in root.iterdir():
-                if p.is_dir():
+                if p.is_dir() and p.name not in self.SKIP_FOLDER_NAMES:
                     await Q.put([parent_id, p])  # Add folder and parent ID to queue
             workers = [asyncio.create_task(folder_worker(sem, Q)) for _ in range(n_workers)]
             await Q.join()
