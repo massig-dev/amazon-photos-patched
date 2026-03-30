@@ -412,6 +412,8 @@ class AmazonPhotos:
         path = Path(path)
         folder_map, folders = self.create_folders(path)
 
+        # ファイル走査でも SKIP_FOLDER_NAMES を除外する
+        # create_folders と同じ除外リストを使うこと（不一致だとフォルダなしファイルが発生）
         def _not_in_skip(f: Path) -> bool:
             return not any(part in self.SKIP_FOLDER_NAMES for part in f.parts)
 
@@ -1060,7 +1062,15 @@ class AmazonPhotos:
             last_child = i == len(node['children']) - 1
             self.print_tree(child, show_id, color, indent, prefix, last_child)
 
-    # Synology / macOS / Windows のシステムフォルダを除外
+    # ──────────────────────────────────────────────────────────────
+    # SKIP_FOLDER_NAMES — NAS / OS のシステムフォルダを除外
+    #
+    # 重要: Synology の @eaDir は各ファイルと同名のサブディレクトリを持つ:
+    #   @eaDir/IMG_0001.JPG/  ← ディレクトリ（サムネイルキャッシュ）
+    # これを除外しないと create_folders が Amazon Drive に
+    # "IMG_0001.JPG" という名前のフォルダを大量に作成してしまう。
+    # 2026-03-30: 26,000+ のゴミフォルダが作成された事故を修正。
+    # ──────────────────────────────────────────────────────────────
     SKIP_FOLDER_NAMES = frozenset({
         '@eaDir', '#recycle', '.DS_Store', 'Thumbs.db',
         '@tmp', '#snapshot', '.synology_recycle',
@@ -1068,7 +1078,17 @@ class AmazonPhotos:
 
     def create_folders(self, path: str | Path) -> tuple[dict, list[dict]]:
         """
-        Recursively create folders in Amazon Photos
+        Recursively create folders in Amazon Photos.
+
+        処理の流れ:
+        1. find_path() で Amazon Drive 上の既存 root フォルダを探索
+        2. ローカルのディレクトリ構造を再帰走査（SKIP_FOLDER_NAMES を除外）
+        3. 各フォルダを POST /nodes (kind=FOLDER) で作成（既存なら 409）
+        4. folder_map {相対パス: Amazon nodeID} を返す
+
+        注意:
+        - iterdir() のフィルタに SKIP_FOLDER_NAMES を必ず含めること
+        - upload() 内のファイル走査（rglob）にも同じ除外が必要
 
         @param path: path to root folder to create
         @return: a {folder: parent ID} map, and list of created folders
